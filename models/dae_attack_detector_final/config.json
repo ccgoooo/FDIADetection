@@ -1,0 +1,5 @@
+{
+  "input_dim": 84,
+  "device": "cpu",
+  "threshold": 0.568218469619751
+}
