@@ -1,0 +1,12 @@
+{
+  "total_samples": 10000,
+  "normal_samples": 8042,
+  "attack_samples": 1958,
+  "attack_ratio": 0.2,
+  "feature_dim": 14,
+  "attack_type_distribution": {
+    "random": 0.4,
+    "stealthy": 0.3,
+    "coordinated": 0.3
+  }
+}
