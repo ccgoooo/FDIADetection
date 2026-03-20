@@ -1,0 +1,13 @@
+{
+  "sampling_rate": 0.15,
+  "total_hours": 24,
+  "window_size": 10,
+  "step": 5,
+  "n_attacks": 65,
+  "min_duration": 80,
+  "max_duration": 120,
+  "train_ratio": 0.7,
+  "val_ratio": 0.15,
+  "use_feature_enhancement": true,
+  "feature_dim": 84
+}

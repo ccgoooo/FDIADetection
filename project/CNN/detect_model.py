@@ -10,7 +10,7 @@ from sklearn.metrics import classification_report, confusion_matrix, roc_curve, 
 import seaborn as sns
 from torch.utils.data import DataLoader, TensorDataset
 import os
-from model import ResidualCNN,DeepResidualCNN,FastConvLSTM,LightweightTransformer
+from model import ResidualCNN,DeepResidualCNN,FastConvLSTM,LightweightTransformer,SimpleCNN,LSTMNet
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']  # 微软雅黑、黑体
 plt.rcParams['axes.unicode_minus'] = False
 
@@ -26,6 +26,16 @@ class CNNTrainer:
     
     def create_model(self, model_type="ResidualCNN", feature_dim=84, window_size=10, dropout_rate=0.3):
         """创建模型"""
+        if model_type == "SimpleCNN":
+            self.model = SimpleCNN(
+                window_size=window_size, 
+                feature_dim=feature_dim, 
+                dropout_rate=dropout_rate).to(self.device)
+        if model_type == "LSTM":
+            self.model = LSTMNet(
+                window_size=window_size, 
+                feature_dim=feature_dim, 
+                dropout_rate=dropout_rate).to(self.device)
         if model_type == "DeepResidualCNN":
             self.model = DeepResidualCNN(
                 window_size=window_size,
@@ -437,7 +447,7 @@ def main():
     
     # 4. 创建模型（可以选择ResidualCNN或DeepResidualCNN）
     print("\n步骤4: 创建模型...")
-    model_type = "LightweightTransformer"  # 可以改为"DeepResidualCNN"\"convLSTM"\"LightweightTransformer"
+    model_type = "DeepResidualCNN"  # 可以改为"DeepResidualCNN"\"convLSTM"\"LightweightTransformer"
     trainer.create_model(
         model_type=model_type,
         feature_dim=feature_dim,

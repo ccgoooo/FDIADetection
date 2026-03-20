@@ -1,14 +1,11 @@
-# dashboard.py 简化版本
+# dashboard.py 最小工作版本
 import dash
 from dash import dcc, html
 import plotly.graph_objs as go
 from collections import deque
-import numpy as np
 import datetime
 
 class RealtimeDashboard:
-    """简化版实时仪表板"""
-    
     def __init__(self, max_length=100):
         self.app = dash.Dash(__name__)
         self.data = {
@@ -34,13 +31,25 @@ class RealtimeDashboard:
             fig = go.Figure()
             
             if len(self.data['times']) > 0:
-                # 测量值
+                # 测量值（取第一个特征，通常为电压）
                 fig.add_trace(go.Scatter(
                     x=list(self.data['times']),
                     y=list(self.data['values']),
                     mode='lines',
-                    name='测量值'
+                    name='测量值',
+                    line=dict(color='blue')
                 ))
+                
+                # 残差（如果有）
+                if len(self.data['residuals']) > 0:
+                    fig.add_trace(go.Scatter(
+                        x=list(self.data['times']),
+                        y=list(self.data['residuals']),
+                        mode='lines',
+                        name='残差',
+                        line=dict(color='red'),
+                        yaxis='y2'
+                    ))
                 
                 # 标记攻击点
                 attack_times = [t for t, a in zip(self.data['times'], self.data['alarms']) if a]
@@ -54,24 +63,42 @@ class RealtimeDashboard:
                         name='攻击'
                     ))
             
+            fig.update_layout(
+                title='FDIA实时监控',
+                xaxis_title='时间',
+                yaxis=dict(title='测量值', side='left'),
+                yaxis2=dict(title='残差', side='right', overlaying='y'),
+                hovermode='x unified'
+            )
             return fig
     
     def update_data(self, data):
-        """更新数据"""
         self.data['times'].append(data.get('timestamp', datetime.datetime.now()))
         
-        # 修复：检查measurement是否为None
+        # 测量值（取第一个特征）
         measurement = data.get('measurement')
         if measurement is not None:
-            # 如果measurement是数组，取第一个值
             if hasattr(measurement, '__len__') and len(measurement) > 0:
                 value = measurement[0]
             else:
                 value = measurement
         else:
             value = 0
-        
         self.data['values'].append(value)
-        self.data['alarms'].append(data.get('bdd_result', {}).get('is_attack', False))
+        
+        # 更新残差
+        bdd_result = data.get('bdd_result', {})
+        residual = bdd_result.get('residual_norm', 0)
+        self.data['residuals'].append(residual)
+        
+        # 更新报警
+        self.data['alarms'].append(bdd_result.get('is_attack', False))
+    
     def run(self, debug=False, port=8050):
-        self.app.run_server(debug=debug, port=port)
+        try:
+            print(f"尝试启动仪表板于 http://localhost:{port}")
+            self.app.run(debug=debug, port=port, use_reloader=False)
+        except Exception as e:
+            print(f"仪表板启动失败: {e}")
+            import traceback
+            traceback.print_exc()

@@ -2,6 +2,55 @@ import torch
 import torch.nn as nn
 import math
 
+# =============== 基础CNN ==============
+class SimpleCNN(nn.Module):
+    """传统CNN（无残差连接）"""
+    def __init__(self, window_size=10, feature_dim=84, dropout_rate=0.3):
+        super(SimpleCNN, self).__init__()
+        # 初始卷积
+        self.conv1 = nn.Conv1d(feature_dim, 64, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout_rate)
+
+        # 第二个卷积（代替第一个残差块）
+        self.conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.pool1 = nn.MaxPool1d(2)
+
+        # 第三个卷积（代替第二个残差块）
+        self.conv3 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(128)
+        self.pool2 = nn.MaxPool1d(2)
+
+        # 第四个卷积（代替第三个残差块）
+        self.conv4 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm1d(256)
+        self.global_pool = nn.AdaptiveAvgPool1d(4)
+
+        # 全连接层（与ResidualCNN相同）
+        self.fc = nn.Sequential(
+            nn.Linear(256 * 4, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.5),
+            nn.Linear(64, 2)
+        )
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)  # (batch, features, seq_len)
+        x = self.dropout(self.relu(self.bn1(self.conv1(x))))
+        x = self.pool1(self.dropout(self.relu(self.bn2(self.conv2(x)))))
+        x = self.pool2(self.dropout(self.relu(self.bn3(self.conv3(x)))))
+        x = self.global_pool(self.dropout(self.relu(self.bn4(self.conv4(x)))))
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+
 # ================ 残差CNN模型 ================
 class ResidualBlock(nn.Module):
     """残差块"""
@@ -203,7 +252,35 @@ class DeepResidualCNN(nn.Module):
         
         return x
     
-# ===============================================
+# ==================== LSTM模型 =====================
+class LSTMNet(nn.Module):
+    """双层LSTM网络"""
+    def __init__(self, window_size=10, feature_dim=84, hidden_size=128, num_layers=2, dropout_rate=0.3, num_classes=2):
+        super(LSTMNet, self).__init__()
+        self.lstm = nn.LSTM(
+            input_size=feature_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout_rate if num_layers > 1 else 0,
+            bidirectional=False
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(64, num_classes)
+        )
+
+    def forward(self, x):
+        # x: (batch, seq_len, feature_dim)
+        lstm_out, (h_n, c_n) = self.lstm(x)
+        # 取最后一个时间步的输出
+        last_out = lstm_out[:, -1, :]  # (batch, hidden_size)
+        out = self.fc(last_out)
+        return out
+
+
 # ================ ConvLSTM  ================
 class FastConvLSTM(nn.Module):
     """
@@ -568,3 +645,109 @@ class LightweightTransformer(nn.Module):
         output = self.classifier(pooled)
         
         return output
+    
+# ================ 消融实验专用模型 ================
+
+class PlainCNN7(nn.Module):
+    """无残差连接的普通CNN，与ResidualCNN具有相同的卷积层数（7层卷积）"""
+    def __init__(self, window_size=10, feature_dim=84, dropout_rate=0.3):
+        super(PlainCNN7, self).__init__()
+        # 初始卷积层
+        self.conv1 = nn.Conv1d(feature_dim, 64, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout_rate)
+
+        # 替代第一个残差块的两个卷积层（无跳跃连接）
+        self.conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.conv3 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(64)
+        self.pool1 = nn.MaxPool1d(2)
+
+        # 替代第二个残差块的两个卷积层（通道升到128）
+        self.conv4 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm1d(128)
+        self.conv5 = nn.Conv1d(128, 128, kernel_size=3, padding=1)
+        self.bn5 = nn.BatchNorm1d(128)
+        self.pool2 = nn.MaxPool1d(2)
+
+        # 替代第三个残差块的两个卷积层（通道升到256）
+        self.conv6 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
+        self.bn6 = nn.BatchNorm1d(256)
+        self.conv7 = nn.Conv1d(256, 256, kernel_size=3, padding=1)
+        self.bn7 = nn.BatchNorm1d(256)
+
+        self.global_pool = nn.AdaptiveAvgPool1d(4)
+
+        # 分类器（与ResidualCNN相同）
+        self.fc = nn.Sequential(
+            nn.Linear(256 * 4, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.5),
+            nn.Linear(64, 2)
+        )
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)  # (batch, features, seq_len)
+        # 初始卷积
+        x = self.dropout(self.relu(self.bn1(self.conv1(x))))
+        # 第一个残差块位置（两个普通卷积）
+        x = self.dropout(self.relu(self.bn2(self.conv2(x))))
+        x = self.dropout(self.relu(self.bn3(self.conv3(x))))
+        x = self.pool1(x)
+        # 第二个残差块位置
+        x = self.dropout(self.relu(self.bn4(self.conv4(x))))
+        x = self.dropout(self.relu(self.bn5(self.conv5(x))))
+        x = self.pool2(x)
+        # 第三个残差块位置
+        x = self.dropout(self.relu(self.bn6(self.conv6(x))))
+        x = self.dropout(self.relu(self.bn7(self.conv7(x))))
+        # 全局池化
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+
+class ResidualCNN1(nn.Module):
+    """只包含一个残差块的ResidualCNN（对应B组）"""
+    def __init__(self, window_size=10, feature_dim=84, dropout_rate=0.3):
+        super(ResidualCNN1, self).__init__()
+        self.initial_conv = nn.Sequential(
+            nn.Conv1d(feature_dim, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        # 仅第一个残差块
+        self.residual_block1 = ResidualBlock(64, 64, dropout_rate=dropout_rate)
+        self.pool1 = nn.MaxPool1d(2)
+
+        # 后续不再增加通道，直接池化后分类
+        self.global_pool = nn.AdaptiveAvgPool1d(4)
+
+        self.fc = nn.Sequential(
+            nn.Linear(64 * 4, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.5),
+            nn.Linear(64, 2)
+        )
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.initial_conv(x)
+        x = self.residual_block1(x)
+        x = self.pool1(x)
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x

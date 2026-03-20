@@ -9,6 +9,7 @@ from datetime import datetime
 import torch
 from data_pipeline import FDIA_DataPipeline
 import warnings
+import time
 import numpy as np
 
 warnings.filterwarnings('ignore', message='numba cannot be imported')
@@ -36,7 +37,15 @@ def run_complete_pipeline():
             daemon=True
         )
         dashboard_thread.start()
-        print(f"  仪表板已启动，请访问 http://localhost:8050")
+
+        # 等待2秒让仪表板启动
+        time.sleep(2)
+
+        # 检查线程是否还活着
+        if dashboard_thread.is_alive():
+            print(f"  ✅ 仪表板已启动，请访问 http://localhost:8050")
+        else:
+            print(f"  ❌ 仪表板启动失败，请检查控制台错误信息")
         
         # 3. 初始化其他组件
         print("\n[2/4] 初始化数据生成器...")
@@ -93,8 +102,8 @@ def run_complete_pipeline():
                 if bdd_result['is_attack']:
                     attack_count += 1
                 
-                # 每10个样本打印一次状态
-                if sample_count % 10 == 0:
+                # 每30个样本打印一次状态
+                if sample_count % 30 == 0:
                     print(f"  样本数: {sample_count}, 攻击: {attack_count}, "
                           f"残差: {bdd_result['residual_norm']:.4f}")
             

@@ -1,4 +1,3 @@
-# test_convergence.py
 import pandapower as pp
 import pandapower.networks as nw
 import numpy as np

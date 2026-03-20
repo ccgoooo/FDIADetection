@@ -1,7 +1,7 @@
-# dae_attack_detector.py
 """
 深度自编码器（DAE）用于电力系统虚假数据注入攻击检测
 实现半监督学习，结合少量标签数据进行攻击检测
+首先，对带有时间窗口的输入数据取最后一个时间步作为当前时刻的特征，并对训练集进行类别平衡采样以缓解不平衡问题；然后，定义包含编码器、解码器和额外分类头的网络结构，使用MSE重构损失和BCE分类损失共同训练；训练过程中通过早停机制保存最佳模型，并在验证集上基于重构误差寻找使F1分数最大化的检测阈值；最后，在测试集上计算重构误差并与阈值比较完成攻击检测，同时输出分类器的置信度，并通过丰富的可视化（误差分布、ROC曲线、混淆矩阵等）评估性能。整个过程兼顾了无监督的重构能力和有监督的分类能力，实现了对FDIA的精准识别。
 """
 
 import torch
@@ -1000,7 +1000,7 @@ def run_dae_attack_detection():
     
     # 手动测试新阈值
     print("\n" + "="*60)
-    print("手动测试新阈值 0.25")
+    print("手动测试新阈值 0.14")
     print("="*60)
     
     # new_threshold = 0.25
@@ -1011,7 +1011,7 @@ def run_dae_attack_detection():
     
     # 使用
     print("分析漏报情况")
-    false_negatives = analyze_false_negatives(dae_detector, X_test, y_test, threshold=0.25)
+    false_negatives = analyze_false_negatives(dae_detector, X_test, y_test, threshold=0.14)
 
     # 5. 保存模型
     print("\n5. 保存模型...")

@@ -1,832 +1,551 @@
-# wgan_generator.py
+# correct_wgan_trainer.py
 """
-WGAN生成器用于生成虚假数据注入攻击的异常数据
-用于数据增强，解决样本稀缺问题
+正确的WGAN训练流程，包含分类器指导
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+from tqdm import tqdm
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, TensorDataset
-import pickle
-import os
-import warnings
-warnings.filterwarnings('ignore')
+from sklearn.manifold import TSNE
+from scipy.stats import wasserstein_distance
 
-plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
-plt.rcParams['axes.unicode_minus'] = False
-
-class Generator(nn.Module):
-    """WGAN生成器网络"""
+class CorrectWGAN:
+    """正确的WGAN训练实现"""
     
-    def __init__(self, latent_dim=100, output_dim=84, hidden_dims=[256, 512, 256]):
-        """
-        初始化生成器
-        
-        参数:
-            latent_dim: 潜在空间维度
-            output_dim: 输出维度（特征数）
-            hidden_dims: 隐藏层维度列表
-        """
-        super(Generator, self).__init__()
-        
-        self.latent_dim = latent_dim
-        
-        # 构建网络层
-        layers = []
-        input_dim = latent_dim
-        
-        for i, hidden_dim in enumerate(hidden_dims):
-            layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
-            input_dim = hidden_dim
-        
-        # 输出层
-        layers.append(nn.Linear(input_dim, output_dim))
-        layers.append(nn.Tanh())  # 使用Tanh将输出限制在[-1,1]
-        
-        self.model = nn.Sequential(*layers)
-        
-    def forward(self, z):
-        """前向传播"""
-        return self.model(z)
-    
-    def generate(self, num_samples, device='cpu'):
-        """生成样本"""
-        self.eval()
-        with torch.no_grad():
-            z = torch.randn(num_samples, self.latent_dim).to(device)
-            samples = self(z)
-        return samples.cpu().numpy()
-
-
-class Critic(nn.Module):
-    """WGAN判别器（批评家）"""
-    
-    def __init__(self, input_dim=84, hidden_dims=[256, 128, 64]):
-        """
-        初始化判别器
-        
-        参数:
-            input_dim: 输入维度
-            hidden_dims: 隐藏层维度列表
-        """
-        super(Critic, self).__init__()
-        
-        # 构建网络层（WGAN不使用批归一化在判别器中）
-        layers = []
-        current_dim = input_dim
-        
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(current_dim, hidden_dim))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
-            current_dim = hidden_dim
-        
-        # 输出层：WGAN输出实数，不是概率
-        layers.append(nn.Linear(current_dim, 1))
-        
-        self.model = nn.Sequential(*layers)
-        
-    def forward(self, x):
-        """前向传播"""
-        return self.model(x)
-
-
-class Classifier(nn.Module):
-    """辅助分类器，用于指导生成器生成特定类别的数据"""
-    
-    def __init__(self, input_dim=84, hidden_dims=[128, 64], num_classes=2):
-        """
-        初始化分类器
-        
-        参数:
-            input_dim: 输入维度
-            hidden_dims: 隐藏层维度列表
-            num_classes: 类别数
-        """
-        super(Classifier, self).__init__()
-        
-        layers = []
-        current_dim = input_dim
-        
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(current_dim, hidden_dim))
-            layers.append(nn.ReLU(inplace=True))
-            layers.append(nn.Dropout(0.3))
-            current_dim = hidden_dim
-        
-        # 输出层
-        layers.append(nn.Linear(current_dim, num_classes))
-        
-        self.model = nn.Sequential(*layers)
-        
-    def forward(self, x):
-        """前向传播"""
-        return self.model(x)
-
-
-class WGAN_GP:
-    """WGAN with Gradient Penalty (WGAN-GP)"""
-    
-    def __init__(self, generator, critic, classifier=None, latent_dim=100, 
-                 device='cuda' if torch.cuda.is_available() else 'cpu'):
-        """
-        初始化WGAN-GP
-        
-        参数:
-            generator: 生成器
-            critic: 判别器
-            classifier: 分类器（可选）
-            latent_dim: 潜在空间维度
-            device: 计算设备
-        """
+    def __init__(self, generator, critic, classifier, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.generator = generator.to(device)
         self.critic = critic.to(device)
-        self.classifier = classifier.to(device) if classifier else None
+        self.classifier = classifier.to(device)  # 分类器用于指导，不更新
         
-        self.latent_dim = latent_dim
         self.device = device
         
         # 优化器
         self.g_optimizer = optim.Adam(self.generator.parameters(), lr=0.0001, betas=(0.5, 0.9))
         self.c_optimizer = optim.Adam(self.critic.parameters(), lr=0.0001, betas=(0.5, 0.9))
         
-        if self.classifier:
-            self.clf_optimizer = optim.Adam(self.classifier.parameters(), lr=0.001)
-            self.clf_criterion = nn.CrossEntropyLoss()
-        
-        # 训练历史
+        # 损失记录
         self.g_losses = []
         self.c_losses = []
-        self.gp_losses = []
         
-    def compute_gradient_penalty(self, real_samples, fake_samples):
-        """
-        计算梯度惩罚（WGAN-GP的关键）
+    def train_critic(self, real_data, n_critic=5):
+        """训练Critic n次"""
+        batch_size = real_data.size(0)
+        c_loss_total = 0
         
-        参数:
-            real_samples: 真实样本
-            fake_samples: 生成样本
-        """
-        batch_size = real_samples.size(0)
+        for _ in range(n_critic):
+            # 生成假数据
+            z = torch.randn(batch_size, self.generator.latent_dim, device=self.device)
+            fake_data = self.generator(z).detach()
+            
+            # 计算Critic损失
+            real_scores = self.critic(real_data)
+            fake_scores = self.critic(fake_data)
+            
+            # WGAN损失：最大化真实数据与生成数据的Wasserstein距离
+            c_loss = -(torch.mean(real_scores) - torch.mean(fake_scores))
+            
+            # 梯度惩罚
+            gradient_penalty = self._gradient_penalty(real_data, fake_data)
+            c_loss += 10 * gradient_penalty
+            
+            # 更新Critic
+            self.c_optimizer.zero_grad()
+            c_loss.backward()
+            self.c_optimizer.step()
+            
+            c_loss_total += c_loss.item()
         
-        # 生成随机权重
-        alpha = torch.rand(batch_size, 1, device=self.device)
-        alpha = alpha.expand_as(real_samples)
+        return c_loss_total / n_critic
+    
+    def train_generator(self, batch_size, lambda_cls=0.1):
+        """训练Generator，包含分类器指导"""
+        # 生成假数据
+        z = torch.randn(batch_size, self.generator.latent_dim, device=self.device)
+        fake_data = self.generator(z)
+        
+        # Critic损失（WGAN损失）
+        fake_scores = self.critic(fake_data)
+        g_loss_critic = -torch.mean(fake_scores)
+        
+        # 分类器损失：鼓励生成的数据被分类为攻击（类别1）
+        if self.classifier is not None:
+            with torch.no_grad():  # 分类器不更新
+                predictions = self.classifier(fake_data)
+                # 我们希望生成的数据被分类为攻击类别（假设攻击=1）
+                target_class = torch.ones(batch_size, dtype=torch.long, device=self.device)
+                g_loss_cls = nn.CrossEntropyLoss()(predictions, target_class)
+        else:
+            g_loss_cls = 0
+        
+        # 总损失
+        g_loss = g_loss_critic + lambda_cls * g_loss_cls
+        
+        # 更新Generator
+        self.g_optimizer.zero_grad()
+        g_loss.backward()
+        self.g_optimizer.step()
+        
+        return g_loss.item(), g_loss_critic.item(), g_loss_cls if isinstance(g_loss_cls, float) else g_loss_cls.item()
+    
+    def _gradient_penalty(self, real_data, fake_data):
+        """计算梯度惩罚（WGAN-GP）"""
+        batch_size = real_data.size(0)
+        epsilon = torch.rand(batch_size, 1, device=self.device).expand_as(real_data)
         
         # 插值样本
-        interpolated = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)
+        interpolated = (epsilon * real_data + (1 - epsilon) * fake_data).requires_grad_(True)
         
-        # 计算判别器对插值样本的输出
-        d_interpolated = self.critic(interpolated)
+        # Critic对插值样本的评分
+        scores = self.critic(interpolated)
         
         # 计算梯度
-        grad_outputs = torch.ones_like(d_interpolated, device=self.device)
         gradients = torch.autograd.grad(
-            outputs=d_interpolated,
+            outputs=scores,
             inputs=interpolated,
-            grad_outputs=grad_outputs,
+            grad_outputs=torch.ones_like(scores),
             create_graph=True,
             retain_graph=True,
-            only_inputs=True
         )[0]
         
-        # 计算梯度惩罚
+        # 梯度惩罚：梯度范数偏离1的惩罚
         gradients = gradients.view(batch_size, -1)
-        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+        gradient_norm = gradients.norm(2, dim=1)
+        gradient_penalty = ((gradient_norm - 1) ** 2).mean()
         
         return gradient_penalty
     
-    def train_step(self, real_data, target_labels=None, lambda_gp=10, lambda_cls=1.0):
-        """
-        训练一步
-        
-        参数:
-            real_data: 真实数据
-            target_labels: 目标标签（用于分类器指导）
-            lambda_gp: 梯度惩罚系数
-            lambda_cls: 分类器损失系数
-        """
-        batch_size = real_data.size(0)
-        
-        # ========== 训练判别器 ==========
-        self.critic.train()
-        self.generator.eval()
-        
-        # 生成假数据
-        z = torch.randn(batch_size, self.latent_dim, device=self.device)
-        fake_data = self.generator(z).detach()
-        
-        # 计算判别器损失
-        real_output = self.critic(real_data)
-        fake_output = self.critic(fake_data)
-        
-        # Wasserstein距离
-        wasserstein_distance = real_output.mean() - fake_output.mean()
-        
-        # 梯度惩罚
-        gradient_penalty = self.compute_gradient_penalty(real_data, fake_data)
-        
-        # 总损失
-        c_loss = -wasserstein_distance + lambda_gp * gradient_penalty
-        
-        # 反向传播
-        self.c_optimizer.zero_grad()
-        c_loss.backward()
-        self.c_optimizer.step()
-        
-        # ========== 训练生成器 ==========
-        if self.classifier and target_labels is not None:
-            # 每5步训练一次生成器（WGAN标准做法）
-            if len(self.g_losses) % 5 == 0:
-                self.critic.eval()
-                self.generator.train()
-                
-                # 生成新数据
-                z = torch.randn(batch_size, self.latent_dim, device=self.device)
-                generated_data = self.generator(z)
-                
-                # 判别器损失
-                g_loss_d = -self.critic(generated_data).mean()
-                
-                # 分类器损失：确保生成的数据被分类为目标类别（攻击数据）
-                if self.classifier:
-                    classifier_output = self.classifier(generated_data)
-                    g_loss_cls = self.clf_criterion(classifier_output, target_labels)
-                    g_loss = g_loss_d + lambda_cls * g_loss_cls
-                else:
-                    g_loss = g_loss_d
-                
-                # 反向传播
-                self.g_optimizer.zero_grad()
-                g_loss.backward()
-                self.g_optimizer.step()
-                
-                # 记录损失
-                self.g_losses.append(g_loss.item())
-        
-        # 记录损失
-        self.c_losses.append(c_loss.item())
-        self.gp_losses.append(gradient_penalty.item())
-        
-        return {
-            'c_loss': c_loss.item(),
-            'w_distance': wasserstein_distance.item(),
-            'gp_loss': gradient_penalty.item(),
-            'g_loss': self.g_losses[-1] if len(self.g_losses) > 0 else 0
-        }
-    
-    def train_classifier(self, train_loader, epochs=10):
-        """预训练分类器"""
-        if not self.classifier:
-            print("没有分类器可训练")
-            return
-        
-        self.classifier.train()
+    def train(self, data_loader, epochs=1000, n_critic=5, lambda_cls=0.1):
+        """完整训练流程"""
+        print(f"开始训练WGAN，设备: {self.device}")
+        print(f"Critic每轮训练次数: {n_critic}, 分类器权重: {lambda_cls}")
         
         for epoch in range(epochs):
-            total_loss = 0
-            correct = 0
-            total = 0
+            epoch_c_loss = 0
+            epoch_g_loss = 0
             
-            for data, labels in train_loader:
-                data = data.to(self.device)
-                labels = labels.to(self.device).long()
+            for batch_idx, (real_data, _) in enumerate(data_loader):
+                real_data = real_data.to(self.device)
                 
-                # 前向传播
-                outputs = self.classifier(data)
-                loss = self.clf_criterion(outputs, labels)
+                # 训练Critic n次
+                c_loss = self.train_critic(real_data, n_critic)
+                epoch_c_loss += c_loss
                 
-                # 反向传播
-                self.clf_optimizer.zero_grad()
-                loss.backward()
-                self.clf_optimizer.step()
-                
-                # 统计
-                total_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
+                # 训练Generator 1次
+                g_loss, g_loss_critic, g_loss_cls = self.train_generator(
+                    real_data.size(0), lambda_cls
+                )
+                epoch_g_loss += g_loss
             
-            acc = 100 * correct / total
-            print(f'分类器训练 Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(train_loader):.4f}, Acc: {acc:.2f}%')
-    
-    def generate_attack_data(self, num_samples, target_class=1):
-        """
-        生成攻击数据
-        
-        参数:
-            num_samples: 生成样本数量
-            target_class: 目标类别（1=攻击，0=正常）
-        """
-        self.generator.eval()
-        
-        # 生成潜在向量
-        z = torch.randn(num_samples, self.latent_dim, device=self.device)
-        
-        # 生成数据
-        with torch.no_grad():
-            generated_data = self.generator(z)
-        
-        # 如果需要，使用分类器进行筛选
-        if self.classifier:
-            with torch.no_grad():
-                predictions = self.classifier(generated_data)
-                _, predicted_classes = torch.max(predictions, 1)
+            # 记录损失
+            avg_c_loss = epoch_c_loss / len(data_loader)
+            avg_g_loss = epoch_g_loss / len(data_loader)
             
-            # 筛选出被分类为目标类别的样本
-            target_indices = (predicted_classes == target_class).nonzero().squeeze()
-            
-            if target_indices.numel() > 0:
-                if target_indices.dim() == 0:
-                    target_indices = target_indices.unsqueeze(0)
-                generated_data = generated_data[target_indices]
-        
-        return generated_data.cpu().numpy()
-    
-    def save_models(self, path="models/wgan"):
-        """保存模型"""
-        os.makedirs(path, exist_ok=True)
-        
-        torch.save(self.generator.state_dict(), f"{path}/generator.pth")
-        torch.save(self.critic.state_dict(), f"{path}/critic.pth")
-        
-        if self.classifier:
-            torch.save(self.classifier.state_dict(), f"{path}/classifier.pth")
-        
-        # 保存训练历史
-        history = {
-            'g_losses': self.g_losses,
-            'c_losses': self.c_losses,
-            'gp_losses': self.gp_losses
-        }
-        
-        with open(f"{path}/training_history.pkl", 'wb') as f:
-            pickle.dump(history, f)
-        
-        print(f"模型保存到 {path}")
-    
-    def load_models(self, path="models/wgan"):
-        """加载模型"""
-        self.generator.load_state_dict(torch.load(f"{path}/generator.pth", map_location=self.device))
-        self.critic.load_state_dict(torch.load(f"{path}/critic.pth", map_location=self.device))
-        
-        if self.classifier and os.path.exists(f"{path}/classifier.pth"):
-            self.classifier.load_state_dict(torch.load(f"{path}/classifier.pth", map_location=self.device))
-        
-        print(f"模型从 {path} 加载")
-    
-    def plot_training_history(self, save_path=None):
-        """绘制训练历史"""
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        
-        # 1. 判别器损失
-        axes[0, 0].plot(self.c_losses, label='Critic Loss', alpha=0.7)
-        axes[0, 0].set_title('判别器损失')
-        axes[0, 0].set_xlabel('迭代')
-        axes[0, 0].set_ylabel('损失')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # 2. 生成器损失
-        if len(self.g_losses) > 0:
-            axes[0, 1].plot(self.g_losses, label='Generator Loss', color='orange', alpha=0.7)
-            axes[0, 1].set_title('生成器损失')
-            axes[0, 1].set_xlabel('迭代')
-            axes[0, 1].set_ylabel('损失')
-            axes[0, 1].legend()
-            axes[0, 1].grid(True, alpha=0.3)
-        
-        # 3. 梯度惩罚
-        axes[1, 0].plot(self.gp_losses, label='Gradient Penalty', color='green', alpha=0.7)
-        axes[1, 0].set_title('梯度惩罚')
-        axes[1, 0].set_xlabel('迭代')
-        axes[1, 0].set_ylabel('损失')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # 4. 损失对比
-        axes[1, 1].plot(self.c_losses[:min(1000, len(self.c_losses))], label='Critic', alpha=0.7)
-        if len(self.g_losses) > 0:
-            axes[1, 1].plot(self.g_losses[:min(1000, len(self.g_losses))], label='Generator', alpha=0.7)
-        axes[1, 1].set_title('损失对比')
-        axes[1, 1].set_xlabel('迭代')
-        axes[1, 1].set_ylabel('损失')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=150)
-            print(f"训练历史图保存到 {save_path}")
-        
-        plt.show()
-
-
-class AttackDataGenerator:
-    """攻击数据生成器，使用WGAN生成虚假数据"""
-    
-    def __init__(self, feature_dim=84, latent_dim=100, device=None):
-        """
-        初始化攻击数据生成器
-        
-        参数:
-            feature_dim: 特征维度
-            latent_dim: 潜在空间维度
-            device: 计算设备
-        """
-        self.feature_dim = feature_dim
-        self.latent_dim = latent_dim
-        
-        if device is None:
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        else:
-            self.device = device
-        
-        # 初始化模型
-        self.generator = Generator(latent_dim=latent_dim, output_dim=feature_dim)
-        self.critic = Critic(input_dim=feature_dim)
-        self.classifier = Classifier(input_dim=feature_dim)
-        
-        # 初始化WGAN
-        self.wgan = WGAN_GP(
-            generator=self.generator,
-            critic=self.critic,
-            classifier=self.classifier,
-            latent_dim=latent_dim,
-            device=self.device
-        )
-        
-        # 数据存储
-        self.generated_data = None
-        self.generated_labels = None
-    
-    def prepare_attack_data(self, X_train, y_train):
-        """
-        准备攻击数据用于训练
-        
-        参数:
-            X_train: 训练数据
-            y_train: 训练标签
-        """
-        # 提取攻击样本
-        attack_indices = np.where(y_train == 1)[0]
-        attack_data = X_train[attack_indices]
-        
-        print(f"攻击样本数量: {len(attack_data)}")
-        print(f"攻击样本形状: {attack_data.shape}")
-        
-        # 如果数据是窗口数据，取最后一个时间步（或平均值）
-        if len(attack_data.shape) == 3:  # (batch, window, features)
-            print("检测到窗口数据，转换为单个时间步...")
-            # 取窗口最后一个时间步
-            attack_data = attack_data[:, -1, :]
-            print(f"转换后形状: {attack_data.shape}")
-        
-        # 转换为PyTorch张量
-        attack_tensor = torch.FloatTensor(attack_data).to(self.device)
-        
-        # 创建数据加载器
-        attack_dataset = TensorDataset(attack_tensor, torch.ones(len(attack_tensor), dtype=torch.long))
-        attack_loader = DataLoader(attack_dataset, batch_size=32, shuffle=True)
-        
-        return attack_loader
-    
-    def train(self, X_train, y_train, epochs=1000, lambda_cls=1.0):
-        """
-        训练WGAN生成器
-        
-        参数:
-            X_train: 训练数据
-            y_train: 训练标签
-            epochs: 训练轮数
-            lambda_cls: 分类器损失系数
-        """
-        print("开始训练WGAN生成攻击数据...")
-        print(f"设备: {self.device}")
-        
-        # 准备数据
-        attack_loader = self.prepare_attack_data(X_train, y_train)
-        
-        # 预训练分类器（如果有正常和攻击数据）
-        print("\n预训练分类器...")
-        normal_indices = np.where(y_train == 0)[0]
-        normal_data = X_train[normal_indices]
-        
-        if len(normal_data.shape) == 3:
-            normal_data = normal_data[:, -1, :]
-        
-        # 合并数据
-        all_data = np.vstack([normal_data, attack_loader.dataset.tensors[0].cpu().numpy()])
-        all_labels = np.concatenate([
-            np.zeros(len(normal_data)),
-            np.ones(len(attack_loader.dataset))
-        ])
-        
-        # 创建分类器数据加载器
-        clf_dataset = TensorDataset(
-            torch.FloatTensor(all_data).to(self.device),
-            torch.LongTensor(all_labels).to(self.device)
-        )
-        clf_loader = DataLoader(clf_dataset, batch_size=32, shuffle=True)
-        
-        # 训练分类器
-        self.wgan.train_classifier(clf_loader, epochs=10)
-        
-        # 训练WGAN
-        print("\n开始训练WGAN...")
-        for epoch in range(epochs):
-            total_c_loss = 0
-            total_gp_loss = 0
-            
-            for batch_data, _ in attack_loader:
-                batch_data = batch_data.to(self.device)
-                
-                # 目标标签（攻击数据，类别1）
-                target_labels = torch.ones(batch_data.size(0), dtype=torch.long, device=self.device)
-                
-                # 训练一步
-                losses = self.wgan.train_step(batch_data, target_labels, lambda_cls=lambda_cls)
-                
-                total_c_loss += losses['c_loss']
-                total_gp_loss += losses['gp_loss']
+            self.c_losses.append(avg_c_loss)
+            self.g_losses.append(avg_g_loss)
             
             # 打印进度
             if (epoch + 1) % 100 == 0:
-                avg_c_loss = total_c_loss / len(attack_loader)
-                avg_gp_loss = total_gp_loss / len(attack_loader)
+                print(f"Epoch [{epoch+1}/{epochs}], "
+                      f"C Loss: {avg_c_loss:.4f}, G Loss: {avg_g_loss:.4f}")
                 
-                print(f'Epoch [{epoch+1}/{epochs}], Critic Loss: {avg_c_loss:.4f}, GP Loss: {avg_gp_loss:.4f}')
-        
-        print("WGAN训练完成!")
-        
-        # 绘制训练历史
-        self.wgan.plot_training_history(save_path="figures/wgan_training_history.png")
-        
-        # 保存模型
-        self.wgan.save_models("models/wgan_attack_generator")
+                # 生成一些样本检查进度
+                self._visualize_progress(epoch + 1)
     
-    def generate_data(self, num_samples=1000, target_class=1):
-        """
-        生成攻击数据
+    def _visualize_progress(self, epoch, n_samples=5):
+        """可视化训练进度"""
+        self.generator.eval()
+        with torch.no_grad():
+            z = torch.randn(n_samples, self.generator.latent_dim, device=self.device)
+            samples = self.generator(z).cpu().numpy()
         
-        参数:
-            num_samples: 生成样本数量
-            target_class: 目标类别
-            
-        返回:
-            generated_data: 生成的数据
-            generated_labels: 生成的标签
-        """
-        print(f"生成 {num_samples} 个攻击样本...")
-        
-        # 生成数据
-        generated_data = self.wgan.generate_attack_data(num_samples, target_class)
-        
-        # 创建标签
-        generated_labels = np.ones(len(generated_data), dtype=np.int32)
-        
-        print(f"生成完成: {generated_data.shape}")
-        print(f"攻击样本数量: {len(generated_data)}")
-        
-        self.generated_data = generated_data
-        self.generated_labels = generated_labels
-        
-        return generated_data, generated_labels
-    
-    def evaluate_generated_data(self, original_attack_data, save_path=None):
-        """
-        评估生成数据的质量
-        
-        参数:
-            original_attack_data: 原始攻击数据
-            save_path: 保存路径
-        """
-        if self.generated_data is None:
-            print("请先生成数据")
-            return
-        
-        # 确保维度一致
-        if len(original_attack_data.shape) == 3:
-            original_attack_data = original_attack_data[:, -1, :]
-        
-        # 选取部分样本进行可视化
-        n_samples = min(5, len(original_attack_data), len(self.generated_data))
-        
-        fig, axes = plt.subplots(n_samples, 2, figsize=(15, 3*n_samples))
-        
+        fig, axes = plt.subplots(n_samples, 1, figsize=(12, 2*n_samples))
         if n_samples == 1:
-            axes = axes.reshape(1, -1)
-        
-        # 特征维度（假设前56维是原始特征，后28维是扩展特征）
-        n_original_features = min(56, self.feature_dim)
+            axes = [axes]
         
         for i in range(n_samples):
-            # 原始攻击数据
-            axes[i, 0].bar(range(n_original_features), original_attack_data[i, :n_original_features], 
-                          alpha=0.7, label='原始')
-            axes[i, 0].set_title(f'样本 {i}: 原始攻击数据')
-            axes[i, 0].set_xlabel('特征索引')
-            axes[i, 0].set_ylabel('值')
-            axes[i, 0].legend()
-            axes[i, 0].grid(True, alpha=0.3)
+            axes[i].plot(samples[i, :20], alpha=0.7)  # 只显示前20个特征
+            axes[i].set_title(f"生成样本 {i+1} (Epoch {epoch})")
+            axes[i].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(f"figures/wgan_samples_epoch_{epoch}.png", dpi=150)
+        plt.close()
+
+class DataQualityEvaluator:
+    """生成数据质量评估器"""
+    
+    def __init__(self):
+        self.metrics = {}
+    
+    def evaluate_statistical_similarity(self, real_data, fake_data):
+        """
+        评估统计相似性
+        
+        参数:
+            real_data: 真实攻击数据 (n_samples, n_features)
+            fake_data: 生成攻击数据 (n_samples, n_features)
+        """
+        results = {}
+        
+        # 1. 均值和方差比较
+        real_mean = np.mean(real_data, axis=0)
+        fake_mean = np.mean(fake_data, axis=0)
+        real_std = np.std(real_data, axis=0)
+        fake_std = np.std(fake_data, axis=0)
+        
+        results['mean_correlation'] = np.corrcoef(real_mean, fake_mean)[0, 1]
+        results['std_correlation'] = np.corrcoef(real_std, fake_std)[0, 1]
+        
+        # 2. Jensen-Shannon散度（用于分布比较）
+        from scipy.spatial.distance import jensenshannon
+        
+        js_distances = []
+        for i in range(min(real_data.shape[1], fake_data.shape[1])):
+            # 计算每个特征的JS散度
+            real_hist = np.histogram(real_data[:, i], bins=50, density=True)[0]
+            fake_hist = np.histogram(fake_data[:, i], bins=50, density=True)[0]
+            js_dist = jensenshannon(real_hist, fake_hist)
+            js_distances.append(js_dist)
+        
+        results['js_distance_mean'] = np.mean(js_distances)
+        results['js_distance_std'] = np.std(js_distances)
+        
+        # 3. Wasserstein距离（Earth Mover's Distance）
+        wasserstein_distances = []
+        for i in range(min(real_data.shape[1], 10)):  # 只计算前10个特征，减少计算量
+            w_dist = wasserstein_distance(real_data[:, i], fake_data[:, i])
+            wasserstein_distances.append(w_dist)
+        
+        results['wasserstein_mean'] = np.mean(wasserstein_distances)
+        
+        return results
+    
+    def evaluate_feature_correlation(self, real_data, fake_data):
+        """评估特征相关性结构"""
+        # 计算特征相关矩阵
+        real_corr = np.corrcoef(real_data.T)
+        fake_corr = np.corrcoef(fake_data.T)
+        
+        # 相关矩阵的差异
+        corr_diff = np.abs(real_corr - fake_corr)
+        
+        results = {
+            'correlation_matrix_diff_mean': np.mean(corr_diff),
+            'correlation_matrix_diff_max': np.max(corr_diff),
+            'real_corr_rank': np.linalg.matrix_rank(real_corr),
+            'fake_corr_rank': np.linalg.matrix_rank(fake_corr)
+        }
+        
+        return results
+    
+    def evaluate_diversity(self, fake_data):
+        """评估生成数据的多样性"""
+        # 1. 样本间平均距离
+        from scipy.spatial.distance import pdist
+        
+        # 随机采样以减少计算量
+        n_samples = min(500, len(fake_data))
+        indices = np.random.choice(len(fake_data), n_samples, replace=False)
+        sampled_data = fake_data[indices]
+        
+        # 计算成对距离
+        distances = pdist(sampled_data, metric='euclidean')
+        
+        results = {
+            'avg_pairwise_distance': np.mean(distances),
+            'std_pairwise_distance': np.std(distances),
+            'distance_variation': np.var(distances)
+        }
+        
+        # 2. 最近邻距离比率
+        from sklearn.neighbors import NearestNeighbors
+        
+        nbrs = NearestNeighbors(n_neighbors=2).fit(sampled_data)
+        distances, _ = nbrs.kneighbors(sampled_data)
+        
+        # 最近邻距离（排除自身）
+        nn_distances = distances[:, 1]
+        results['avg_nearest_neighbor_distance'] = np.mean(nn_distances)
+        
+        return results
+    
+    def evaluate_classifier_performance(self, fake_data, classifier, target_class=1):
+        """
+        评估分类器对生成数据的性能
+        
+        参数:
+            classifier: 预训练的分类器
+            target_class: 我们希望生成的数据被分类为什么类别
+        """
+        # 确保分类器在评估模式
+        classifier.eval()
+        
+        with torch.no_grad():
+            fake_tensor = torch.FloatTensor(fake_data).to(classifier.device)
+            predictions = classifier(fake_tensor)
             
-            # 生成攻击数据
-            axes[i, 1].bar(range(n_original_features), self.generated_data[i, :n_original_features], 
-                          alpha=0.7, color='orange', label='生成')
-            axes[i, 1].set_title(f'样本 {i}: 生成攻击数据')
-            axes[i, 1].set_xlabel('特征索引')
-            axes[i, 1].set_ylabel('值')
-            axes[i, 1].legend()
-            axes[i, 1].grid(True, alpha=0.3)
+            # 获取预测类别
+            if predictions.shape[1] > 1:  # 多分类
+                _, predicted_classes = torch.max(predictions, 1)
+            else:  # 二分类
+                predicted_classes = (predictions > 0.5).long().squeeze()
+        
+        # 计算准确率
+        correct = (predicted_classes.cpu().numpy() == target_class).sum()
+        accuracy = correct / len(fake_data)
+        
+        # 计算置信度
+        if predictions.shape[1] > 1:
+            probabilities = torch.softmax(predictions, dim=1)
+            target_probs = probabilities[:, target_class].cpu().numpy()
+        else:
+            target_probs = torch.sigmoid(predictions).cpu().numpy().flatten()
+        
+        results = {
+            'classification_accuracy': accuracy,
+            'avg_confidence': np.mean(target_probs),
+            'confidence_std': np.std(target_probs)
+        }
+        
+        return results
+    
+    def visualize_comparison(self, real_data, fake_data, save_path=None):
+        """可视化真实数据与生成数据的比较"""
+        # 使用t-SNE降维可视化
+        tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+        
+        # 合并数据并添加标签
+        combined_data = np.vstack([real_data, fake_data])
+        labels = np.array([0]*len(real_data) + [1]*len(fake_data))
+        
+        # t-SNE降维
+        print("正在进行t-SNE降维...")
+        tsne_results = tsne.fit_transform(combined_data)
+        
+        # 可视化
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # 1. t-SNE散点图
+        axes[0, 0].scatter(tsne_results[labels==0, 0], tsne_results[labels==0, 1], 
+                          alpha=0.5, label='真实攻击数据', s=20)
+        axes[0, 0].scatter(tsne_results[labels==1, 0], tsne_results[labels==1, 1], 
+                          alpha=0.5, label='生成攻击数据', s=20)
+        axes[0, 0].set_title('t-SNE可视化：真实 vs 生成数据')
+        axes[0, 0].set_xlabel('t-SNE 1')
+        axes[0, 0].set_ylabel('t-SNE 2')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # 2. 特征分布对比（随机选3个特征）
+        n_features = real_data.shape[1]
+        sample_features = np.random.choice(n_features, 3, replace=False)
+        
+        for idx, feat_idx in enumerate(sample_features):
+            axes[0, 1].hist(real_data[:, feat_idx], bins=50, alpha=0.5, 
+                           density=True, label=f'真实-特征{feat_idx}')
+            axes[0, 1].hist(fake_data[:, feat_idx], bins=50, alpha=0.5, 
+                           density=True, label=f'生成-特征{feat_idx}')
+        axes[0, 1].set_title('特征分布对比')
+        axes[0, 1].set_xlabel('特征值')
+        axes[0, 1].set_ylabel('密度')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # 3. 均值比较（前20个特征）
+        axes[1, 0].plot(np.mean(real_data, axis=0)[:20], 'o-', label='真实数据均值', alpha=0.7)
+        axes[1, 0].plot(np.mean(fake_data, axis=0)[:20], 's-', label='生成数据均值', alpha=0.7)
+        axes[1, 0].set_title('前20个特征均值对比')
+        axes[1, 0].set_xlabel('特征索引')
+        axes[1, 0].set_ylabel('均值')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # 4. 相关矩阵差异热力图（前10个特征）
+        real_corr = np.corrcoef(real_data[:, :10].T)
+        fake_corr = np.corrcoef(fake_data[:, :10].T)
+        corr_diff = np.abs(real_corr - fake_corr)
+        
+        im = axes[1, 1].imshow(corr_diff, cmap='hot', interpolation='nearest')
+        axes[1, 1].set_title('特征相关矩阵差异（前10个特征）')
+        axes[1, 1].set_xlabel('特征索引')
+        axes[1, 1].set_ylabel('特征索引')
+        plt.colorbar(im, ax=axes[1, 1])
         
         plt.tight_layout()
         
         if save_path:
-            plt.savefig(save_path, dpi=150)
-            print(f"生成数据评估图保存到 {save_path}")
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"可视化结果保存到 {save_path}")
         
         plt.show()
         
-        # 统计比较
-        print("\n生成数据评估:")
-        print(f"原始攻击数据均值: {np.mean(original_attack_data[:, :n_original_features], axis=0)[:5]}")
-        print(f"生成攻击数据均值: {np.mean(self.generated_data[:, :n_original_features], axis=0)[:5]}")
-        print(f"原始攻击数据标准差: {np.std(original_attack_data[:, :n_original_features], axis=0)[:5]}")
-        print(f"生成攻击数据标准差: {np.std(self.generated_data[:, :n_original_features], axis=0)[:5]}")
-        
-        # 计算分布距离（JS散度）
-        from scipy.spatial.distance import jensenshannon
-        
-        # 随机选择一些特征进行比较
-        sample_features = np.random.choice(n_original_features, 5, replace=False)
-        
-        for feat_idx in sample_features:
-            orig_dist = np.histogram(original_attack_data[:, feat_idx], bins=20, density=True)[0]
-            gen_dist = np.histogram(self.generated_data[:, feat_idx], bins=20, density=True)[0]
-            
-            js_distance = jensenshannon(orig_dist, gen_dist)
-            print(f"特征 {feat_idx} JS散度: {js_distance:.4f}")
+        return tsne_results
     
-    def save_generated_data(self, path="data/generated_attack_data.pkl"):
-        """保存生成的数据"""
-        if self.generated_data is None:
-            print("没有生成的数据可保存")
-            return
-        
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        
-        data_dict = {
-            'data': self.generated_data,
-            'labels': self.generated_labels,
-            'feature_dim': self.feature_dim,
-            'description': 'WGAN生成的攻击数据'
-        }
-        
-        with open(path, 'wb') as f:
-            pickle.dump(data_dict, f)
-        
-        print(f"生成数据保存到 {path}")
-    
-    def load_generated_data(self, path="data/generated_attack_data.pkl"):
-        """加载生成的数据"""
-        with open(path, 'rb') as f:
-            data_dict = pickle.load(f)
-        
-        self.generated_data = data_dict['data']
-        self.generated_labels = data_dict['labels']
-        
-        print(f"生成数据从 {path} 加载")
-        print(f"数据形状: {self.generated_data.shape}")
-        
-        return self.generated_data, self.generated_labels
 
+"""
+完整的WGAN数据生成与评估流程
+"""
 
-def main():
-    """主函数：演示WGAN生成攻击数据"""
+def complete_wgan_pipeline():
+    """完整的WGAN数据生成流程"""
     
-    # 1. 加载之前处理的数据
-    print("加载处理后的数据...")
+    # 1. 加载数据
+    print("1. 加载数据...")
     X_train = np.load("processed_data/X_train.npy")
     y_train = np.load("processed_data/y_train.npy")
     
-    print(f"训练数据形状: {X_train.shape}")
-    print(f"训练标签形状: {y_train.shape}")
-    
-    # 2. 创建攻击数据生成器
-    feature_dim = X_train.shape[2]  # 获取特征维度
-    print(f"特征维度: {feature_dim}")
-    
-    generator = AttackDataGenerator(feature_dim=feature_dim, latent_dim=100)
-    
-    # 3. 训练WGAN（如果还没训练）
-    generator.train(X_train, y_train, epochs=500, lambda_cls=0.5)
-    
-    # 或者加载已训练的模型
-    # generator.wgan.load_models("models/wgan_attack_generator")
-    
-    # 4. 生成攻击数据
-    generated_data, generated_labels = generator.generate_data(num_samples=2000)
-    
-    # 5. 评估生成数据
-    # 提取原始攻击数据
+    # 提取攻击数据（假设攻击标签为1）
     attack_indices = np.where(y_train == 1)[0]
-    original_attack_data = X_train[attack_indices]
+    attack_data = X_train[attack_indices]
     
-    generator.evaluate_generated_data(
-        original_attack_data,
-        save_path="figures/generated_data_evaluation.png"
+    # 如果是窗口数据，转换为单时间步
+    if len(attack_data.shape) == 3:
+        attack_data = attack_data[:, -1, :]  # 取最后一个时间步
+    
+    print(f"攻击数据形状: {attack_data.shape}")
+    
+    # 2. 预训练分类器（如果还没有）
+    print("\n2. 预训练分类器...")
+    # 这里假设你已经有一个预训练好的分类器
+    # 如果没有，需要先训练一个
+    
+    # 3. 训练WGAN
+    print("\n3. 训练WGAN...")
+    
+    # 创建模型
+    latent_dim = 100
+    feature_dim = attack_data.shape[1]
+    
+    generator = Generator(latent_dim=latent_dim, output_dim=feature_dim)
+    critic = Critic(input_dim=feature_dim)
+    classifier = None  # 假设已经有预训练的分类器
+    
+    # 创建数据加载器
+    attack_tensor = torch.FloatTensor(attack_data)
+    attack_dataset = torch.utils.data.TensorDataset(attack_tensor, torch.zeros(len(attack_tensor)))
+    attack_loader = torch.utils.data.DataLoader(attack_dataset, batch_size=32, shuffle=True)
+    
+    # 训练WGAN
+    wgan = CorrectWGAN(generator, critic, classifier)
+    wgan.train(attack_loader, epochs=1000, n_critic=5, lambda_cls=0.1)
+    
+    # 4. 生成新数据
+    print("\n4. 生成新数据...")
+    n_samples = len(attack_data) * 2  # 生成两倍于原始攻击数据
+    wgan.generator.eval()
+    
+    with torch.no_grad():
+        z = torch.randn(n_samples, latent_dim, device=wgan.device)
+        generated_data = wgan.generator(z).cpu().numpy()
+    
+    print(f"生成数据形状: {generated_data.shape}")
+    
+    # 5. 评估生成数据质量
+    print("\n5. 评估生成数据质量...")
+    evaluator = DataQualityEvaluator()
+    
+    # 统计相似性评估
+    stats = evaluator.evaluate_statistical_similarity(attack_data, generated_data)
+    print("\n统计相似性评估:")
+    for key, value in stats.items():
+        print(f"  {key}: {value:.4f}")
+    
+    # 特征相关性评估
+    corr_stats = evaluator.evaluate_feature_correlation(attack_data, generated_data)
+    print("\n特征相关性评估:")
+    for key, value in corr_stats.items():
+        print(f"  {key}: {value:.4f}")
+    
+    # 多样性评估
+    diversity_stats = evaluator.evaluate_diversity(generated_data)
+    print("\n多样性评估:")
+    for key, value in diversity_stats.items():
+        print(f"  {key}: {value:.4f}")
+    
+    # 可视化比较
+    print("\n生成可视化比较...")
+    tsne_results = evaluator.visualize_comparison(
+        attack_data[:500],  # 只取一部分用于可视化
+        generated_data[:500],
+        save_path="figures/real_vs_generated_comparison.png"
     )
     
     # 6. 保存生成数据
-    generator.save_generated_data()
+    print("\n6. 保存生成数据...")
+    np.save("data/generated_attack_data.npy", generated_data)
     
-    # 7. 将生成的数据集成到数据管道中
-    # integrate_generated_data_to_pipeline(generated_data, generated_labels)
+    # 7. 生成质量报告
+    generate_quality_report(attack_data, generated_data, stats, corr_stats, diversity_stats)
+    
+    return generated_data
 
-
-def integrate_generated_data_to_pipeline(generated_data, generated_labels, 
-                                        original_data_path="processed_data"):
-    """
-    将生成的数据集成到数据管道中
+def generate_quality_report(real_data, fake_data, stats, corr_stats, diversity_stats):
+    """生成质量评估报告"""
+    report = """
+    =============================================
+    WGAN生成数据质量评估报告
+    =============================================
     
-    参数:
-        generated_data: 生成的数据
-        generated_labels: 生成的标签
-        original_data_path: 原始数据路径
-    """
-    print("\n将生成数据集成到数据管道...")
+    1. 数据基本信息
+       - 真实攻击数据: {} 样本, {} 特征
+       - 生成攻击数据: {} 样本, {} 特征
     
-    # 加载原始数据
-    X_train = np.load(f"{original_data_path}/X_train.npy")
-    y_train = np.load(f"{original_data_path}/y_train.npy")
+    2. 统计相似性
+       - 均值相关性: {:.4f}
+       - 标准差相关性: {:.4f}
+       - JS散度均值: {:.4f}
+       - Wasserstein距离均值: {:.4f}
     
-    # 转换生成数据为窗口格式
-    # 假设生成的数据是单个时间步，我们需要将其转换为窗口
-    window_size = X_train.shape[1]
-    feature_dim = X_train.shape[2]
+    3. 特征相关性
+       - 相关矩阵差异均值: {:.4f}
+       - 相关矩阵差异最大值: {:.4f}
+       - 真实数据相关矩阵秩: {}
+       - 生成数据相关矩阵秩: {}
     
-    # 创建滑动窗口（简单重复）
-    n_samples = len(generated_data)
-    generated_windows = np.zeros((n_samples, window_size, feature_dim))
+    4. 多样性评估
+       - 平均成对距离: {:.4f}
+       - 最近邻平均距离: {:.4f}
+       - 距离方差: {:.4f}
     
-    for i in range(n_samples):
-        # 用生成的数据填充整个窗口
-        generated_windows[i] = np.tile(generated_data[i], (window_size, 1))
+    5. 评估结论
+    """.format(
+        len(real_data), real_data.shape[1],
+        len(fake_data), fake_data.shape[1],
+        stats.get('mean_correlation', 0),
+        stats.get('std_correlation', 0),
+        stats.get('js_distance_mean', 0),
+        stats.get('wasserstein_mean', 0),
+        corr_stats.get('correlation_matrix_diff_mean', 0),
+        corr_stats.get('correlation_matrix_diff_max', 0),
+        corr_stats.get('real_corr_rank', 0),
+        corr_stats.get('fake_corr_rank', 0),
+        diversity_stats.get('avg_pairwise_distance', 0),
+        diversity_stats.get('avg_nearest_neighbor_distance', 0),
+        diversity_stats.get('distance_variation', 0)
+    )
     
-    print(f"生成的窗口数据形状: {generated_windows.shape}")
+    # 添加结论
+    if stats.get('mean_correlation', 0) > 0.8:
+        report += "    - 统计特性保持良好（均值相关性>0.8）\n"
+    else:
+        report += "    - 警告：统计特性保持不佳\n"
     
-    # 合并数据
-    X_train_augmented = np.concatenate([X_train, generated_windows], axis=0)
-    y_train_augmented = np.concatenate([y_train, generated_labels], axis=0)
+    if stats.get('js_distance_mean', 0) < 0.2:
+        report += "    - 分布相似性高（JS散度<0.2）\n"
+    else:
+        report += "    - 警告：分布相似性不足\n"
     
-    print(f"增强后训练数据形状: {X_train_augmented.shape}")
-    print(f"增强后训练标签形状: {y_train_augmented.shape}")
+    if diversity_stats.get('avg_pairwise_distance', 0) > 0.1:
+        report += "    - 生成数据多样性充足\n"
+    else:
+        report += "    - 警告：生成数据多样性不足，可能存在模式崩溃\n"
     
-    # 统计类别分布
-    n_normal = np.sum(y_train_augmented == 0)
-    n_attack = np.sum(y_train_augmented == 1)
+    # 保存报告
+    with open("reports/wgan_quality_report.txt", "w") as f:
+        f.write(report)
     
-    print(f"\n增强后类别分布:")
-    print(f"正常样本: {n_normal} ({n_normal/len(y_train_augmented)*100:.2f}%)")
-    print(f"攻击样本: {n_attack} ({n_attack/len(y_train_augmented)*100:.2f}%)")
-    print(f"不平衡比例: {n_normal/max(n_attack, 1):.2f}:1")
-    
-    # 保存增强后的数据
-    save_dir = "processed_data_augmented"
-    os.makedirs(save_dir, exist_ok=True)
-    
-    np.save(f"{save_dir}/X_train.npy", X_train_augmented)
-    np.save(f"{save_dir}/y_train.npy", y_train_augmented)
-    
-    # 复制其他数据
-    for file_name in ['X_val.npy', 'y_val.npy', 'X_test.npy', 'y_test.npy']:
-        src_path = f"{original_data_path}/{file_name}"
-        dst_path = f"{save_dir}/{file_name}"
-        
-        if os.path.exists(src_path):
-            import shutil
-            shutil.copy(src_path, dst_path)
-    
-    print(f"\n增强数据保存到 {save_dir}")
-    print("数据增强完成！")
-
-
-if __name__ == "__main__":
-    # 测试WGAN
-    main()
-    
-    # 或者直接集成已生成的数据
-    # 首先加载生成的数据
-    # with open("data/attack_single_point.pkl", 'rb') as f:
-    #     data_dict = pickle.load(f)
-    
-    # generated_data = data_dict['data']
-    # generated_labels = data_dict['labels']
-    
-    # # 集成到数据管道
-    # integrate_generated_data_to_pipeline(generated_data, generated_labels)
+    print(report)
+    print("\n详细报告已保存到: reports/wgan_quality_report.txt")

@@ -6,7 +6,7 @@ import warnings
 
 class BDDDetector:
     """
-    简化的BDD检测器 - 基于统计方法
+    简化的BDD检测器 - 一阶差分异常检测，不是真正的BDD检测
     """
     def __init__(self, network_model, threshold=0.05):
         self.network = network_model
@@ -276,40 +276,30 @@ class BDDDetector:
     
     def compute_residual(self, measurements, x_hat=None):
         """
-        计算残差 r = z - h(x̂)
+        假设系统缓慢变化——采用上一次的值作为估计
         
-        参数:
-        measurements: 实际量测值
-        x_hat: 估计的状态（如果不提供，则进行状态估计）
-        
-        返回:
-        residual: 残差向量
-        residual_norm: 残差范数
+        :param self: 说明
+        :param measurements: 说明
+        :param x_hat: 说明
         """
-        # 如果未提供状态估计，进行状态估计
-        if x_hat is None:
-            x_hat = self.state_estimation(measurements)
-        
-        # 计算量测估计值
-        hx = self.compute_hx(x_hat)
-        
-        # 将输入量测转换为数组
-        if isinstance(measurements, dict):
-            z = np.zeros(len(self.measurement_indices))
-            for key, idx in self.measurement_indices.items():
-                if key in measurements:
-                    z[idx] = measurements[key]
-                else:
-                    z[idx] = 0
+        # 将输入转换为数组
+        if isinstance(measurements, np.ndarray):
+            z = measurements[:56]  # 取前56维
         else:
-            # 假设measurements已经是数组，取前n_measurements个
-            z = measurements[:len(self.measurement_indices)]
+            z = measurements
         
-        # 计算残差
-        residual = z - hx
-        residual_norm = np.linalg.norm(residual)
+        # 如果没有历史数据，用当前值作为估计
+        if not hasattr(self, 'last_z'):
+            self.last_z = z
+            residual = np.zeros_like(z)
+            residual_norm = 0
+        else:
+            # 用上一次的值作为估计
+            residual = z - self.last_z
+            residual_norm = np.linalg.norm(residual)
+            self.last_z = z
         
-        return residual, residual_norm, x_hat
+        return residual, residual_norm, z
     
     def detect(self, measurements):
         """

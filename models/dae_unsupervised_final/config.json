@@ -1,0 +1,8 @@
+{
+  "input_dim": 84,
+  "hidden_size": 64,
+  "num_layers": 2,
+  "seq_len": 10,
+  "device": "cpu",
+  "threshold": 0.17039084434509277
+}
